@@ -1,3 +1,2 @@
-iqoptionapi
 flask
-requests
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
