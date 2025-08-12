@@ -1,169 +1,216 @@
 import os
 import time
+import traceback
 from threading import Thread, Lock
 from queue import Queue
 from flask import Flask, request, jsonify
 
-# IQ Option import desde el repo
+# IMPORT: asegúrate en requirements.txt de tener iqoptionapi desde GitHub
 from iqoptionapi.stable_api import IQ_Option
-
-# Config
-IQ_USERNAME = os.getenv("IQ_USERNAME")
-IQ_PASSWORD = os.getenv("IQ_PASSWORD")
-USE_DEMO = True
-
-# Globals
-api = None
-api_lock = Lock()
-connect_thread = None
-order_queue = Queue()
-connected_flag = False
 
 app = Flask(__name__)
 
-def connect_loop():
+# Credenciales desde env vars
+IQ_USERNAME = os.getenv("IQ_USERNAME")
+IQ_PASSWORD = os.getenv("IQ_PASSWORD")
+
+api = None
+api_lock = Lock()
+order_queue = Queue()
+connected_flag = False
+
+def try_connect_once():
     """
-    Hilo de conexión persistente a IQ Option.
-    Intenta reconectar si se cae.
+    Intenta conectar una vez y devuelve (ok_bool, message, profile_or_none, exception_text_or_none)
+    """
+    global api, connected_flag
+    if not IQ_USERNAME or not IQ_PASSWORD:
+        return False, "Credenciales no definidas (IQ_USERNAME / IQ_PASSWORD)", None, None
+
+    try:
+        tmp = IQ_Option(IQ_USERNAME, IQ_PASSWORD)
+        # connect() puede devolver True/False o None; también puede lanzar excepciones
+        try:
+            res = tmp.connect()
+        except Exception as e:
+            res = None
+            ex_text = traceback.format_exc()
+            return False, f"connect() lanzó excepción: {e}", None, ex_text
+
+        # comprobar varias veces check_connect
+        for i in range(10):
+            try:
+                ok = tmp.check_connect()
+            except Exception as e:
+                ok = False
+                ex_text = traceback.format_exc()
+                return False, f"check_connect() lanzó excepción: {e}", None, ex_text
+
+            if ok:
+                try:
+                    tmp.change_balance("PRACTICE")
+                except Exception:
+                    pass
+                profile = None
+                try:
+                    profile = tmp.get_profile()
+                except Exception:
+                    profile = None
+                # asignar global api
+                with api_lock:
+                    api = tmp
+                    connected_flag = True
+                return True, "Conectado correctamente", profile, None
+            time.sleep(1)
+
+        # si no se conectó
+        return False, "check_connect() nunca fue True (timeout)", None, None
+
+    except Exception as e:
+        ex_text = traceback.format_exc()
+        return False, f"Excepción en try_connect_once: {e}", None, ex_text
+
+def connect_loop_background():
+    """
+    Hilo que mantiene la conexión: intenta reconectar cuando se pierde.
     """
     global api, connected_flag
     while True:
-        try:
-            if not IQ_USERNAME or not IQ_PASSWORD:
-                print("⚠️ IQ credentials not set - set IQ_USERNAME and IQ_PASSWORD in env vars")
-                time.sleep(10)
-                continue
-
-            print("🔁 Intentando conectar a IQ Option...")
-            tmp_api = IQ_Option(IQ_USERNAME, IQ_PASSWORD)
-            tmp_api.connect()
-            # retry until connected
-            retry_count = 0
-            while not tmp_api.check_connect() and retry_count < 10:
-                print("⏳ Esperando conexión... retry", retry_count + 1)
-                time.sleep(1)
-                retry_count += 1
-
-            if tmp_api.check_connect():
+        ok, msg, profile, ex = try_connect_once()
+        print("connect_loop:", ok, msg)
+        if ok:
+            # permanecer hasta que la conexión se pierda
+            while True:
                 with api_lock:
-                    api = tmp_api
-                    if USE_DEMO:
-                        try:
-                            api.change_balance("PRACTICE")
-                        except Exception:
-                            pass
-                    connected_flag = True
-                print("✅ Conectado a IQ Option")
-                # permanecer hasta que se desconecte
-                while tmp_api.check_connect():
-                    time.sleep(2)
-                print("⚠️ Se perdió conexión con IQ Option, reintentando...")
-                with api_lock:
-                    api = None
-                    connected_flag = False
-            else:
-                print("❌ No se pudo conectar (timeout), reintentando en 5s")
-                time.sleep(5)
-        except Exception as e:
-            print("❌ Error en connect_loop:", e)
-            with api_lock:
-                api = None
-                connected_flag = False
+                    tmp = api
+                try:
+                    if not tmp or not tmp.check_connect():
+                        print("connect_loop: conexión perdida.")
+                        with api_lock:
+                            api = None
+                            connected_flag = False
+                        break
+                except Exception as e:
+                    print("connect_loop: check_connect lanzó excepción:", e)
+                    with api_lock:
+                        api = None
+                        connected_flag = False
+                    break
+                time.sleep(2)
+        else:
+            if ex:
+                print("connect_loop: detalle excepción:\n", ex)
+            print("connect_loop: esperando 5s antes de reintentar...")
             time.sleep(5)
 
+# Worker simple que manda órdenes (consumidor de cola)
 def order_worker():
-    """
-    Consume la cola de órdenes y las envía cuando hay conexión.
-    """
     global api
     while True:
         data = order_queue.get()
         try:
             symbol = data.get("symbol")
-            direction = data.get("direction")  # "call" o "put"
+            direction = data.get("direction")
             amount = float(data.get("amount", 10))
-            expiration = int(data.get("expiration", 5))  # minutos
-            print("📌 Order worker got:", symbol, direction, amount, expiration)
+            expiration = int(data.get("expiration", 5))
 
-            # esperar hasta que haya conexión (pero con timeout)
-            wait_for = 30  # seg
+            print("Order worker: intentando enviar:", symbol, direction, amount, expiration)
+            # esperar hasta que haya conexión (timeout 30s)
             waited = 0
             while True:
                 with api_lock:
-                    tmp_api = api
-                if tmp_api and tmp_api.check_connect():
+                    tmp = api
+                if tmp and tmp.check_connect():
                     break
                 time.sleep(1)
                 waited += 1
-                if waited >= wait_for:
-                    print("⚠️ Timeout esperando conexión para enviar orden; descartando orden.")
+                if waited >= 30:
+                    print("Order worker: timeout esperando conexión; descartando orden.")
+                    tmp = None
                     break
 
-            if tmp_api and tmp_api.check_connect():
-                # enviar orden (iqoptionapi devuelve (success, id) o similar)
+            if tmp:
                 try:
-                    _, order_id = tmp_api.buy(amount, symbol, direction, expiration)
-                    if order_id:
-                        print(f"✅ Orden enviada. ID: {order_id}")
-                    else:
-                        print("❌ iqoptionapi devolvió fallo al intentar buy.")
+                    ok, order_id = tmp.buy(amount, symbol, direction, expiration)
+                    print("Order worker: buy returned:", ok, order_id)
                 except Exception as e:
-                    print("❌ Error enviando orden:", e)
+                    print("Order worker: exception al buy:", traceback.format_exc())
             else:
-                print("❌ No se envió la orden por falta de conexión.")
+                print("Order worker: no había conexión, orden no enviada.")
         except Exception as e:
-            print("⚠ Error en order_worker:", e)
+            print("Order worker: excepción:", traceback.format_exc())
         finally:
             order_queue.task_done()
 
-@app.route("/", methods=["GET"])
+# Endpoints
+
+@app.route("/")
 def home():
-    status = {"connected": connected_flag}
-    return jsonify(status), 200
+    return jsonify({"status": "ok", "connected": connected_flag}), 200
+
+@app.route("/status")
+def status():
+    info = {"connected": connected_flag}
+    try:
+        with api_lock:
+            tmp = api
+        if tmp and tmp.check_connect():
+            try:
+                profile = tmp.get_profile()
+                info["profile"] = {"id": profile.get("id"), "id2": profile.get("id2")} if profile else None
+            except Exception:
+                info["profile"] = "error al obtener profile"
+        else:
+            info["profile"] = None
+    except Exception as e:
+        info["error"] = str(e)
+    return jsonify(info), 200
+
+@app.route("/debug-connect", methods=["POST","GET"])
+def debug_connect():
+    """
+    Forzar intento de conexión inmediato y devolver resultado detallado.
+    """
+    ok, msg, profile, ex = try_connect_once()
+    resp = {"ok": ok, "message": msg}
+    if profile:
+        resp["profile"] = profile
+    if ex:
+        resp["exception"] = ex
+    return jsonify(resp), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        data = request.json or {}
-        # validaciones básicas
-        symbol = data.get("symbol")
-        direction = data.get("direction")
-        if not symbol or direction not in ("call", "put"):
-            return jsonify({"status": "error", "msg": "payload inválido: symbol y direction(call|put) required"}), 400
+    data = request.get_json() or {}
+    symbol = data.get("symbol")
+    direction = data.get("direction")
+    expiration = int(data.get("expiration", 5))
 
-        # Forzar monto y expiración según tu petición (10$ y 5 min)
-        payload = {
-            "symbol": symbol,
-            "direction": direction,
-            "amount": float(10),      # monto fijo 10$
-            "expiration": int(5)      # expiración fija 5 minutos
-        }
+    if not symbol or direction not in ("call","put"):
+        return jsonify({"status":"error","msg":"payload inválido: symbol y direction(call|put) required"}), 400
 
-        # encolar y devolver respuesta inmediata
-        order_queue.put(payload)
-        print("📩 Señal recibida y encolada:", payload)
-        return jsonify({"status": "ok", "msg": "Orden encolada"}), 200
+    # Si no hay conexión, avisar (no encolamos si no hay conexión)
+    if not connected_flag:
+        return jsonify({"status":"error","msg":"Bot no conectado a IQ Option (intente /debug-connect)"}), 503
 
-    except Exception as e:
-        print("❌ Error en /webhook:", e)
-        return jsonify({"status": "error", "msg": str(e)}), 500
+    payload = {"symbol": symbol, "direction": direction, "amount": 10, "expiration": expiration}
+    order_queue.put(payload)
+    print("Webhook: orden encolada:", payload)
+    return jsonify({"status":"ok","msg":"Orden encolada"}), 200
 
-# Iniciar hilos al arrancar la app (si no están arrancados)
-def ensure_background_threads():
-    global connect_thread
-    if connect_thread is None or not connect_thread.is_alive():
-        connect_thread = Thread(target=connect_loop, daemon=True)
-        connect_thread.start()
-    # start order worker(s)
-    worker = Thread(target=order_worker, daemon=True)
-    worker.start()
-
-# Si se ejecuta directamente (modo debug o local), arrancar la app y threads
+# arrancar hilos background
 if __name__ == "__main__":
-    ensure_background_threads()
-    port = int(os.environ.get("PORT", 5000))
+    # lanzar hilo de conexión persistente
+    t_conn = Thread(target=connect_loop_background, daemon=True)
+    t_conn.start()
+    # lanzar worker de órdenes
+    t_worker = Thread(target=order_worker, daemon=True)
+    t_worker.start()
+    # arrancar Flask
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 else:
-    # cuando Gunicorn importa el app, arrancar los hilos también
-    ensure_background_threads()
-            
+    t_conn = Thread(target=connect_loop_background, daemon=True)
+    t_conn.start()
+    t_worker = Thread(target=order_worker, daemon=True)
+    t_worker.start()
