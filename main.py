@@ -74,18 +74,22 @@ def webhook():
         inversion = int(data.get("amount", 10))  # Cantidad por operación
         expiracion = int(data.get("expiration", 5)) # Minutos
 
-        status, order_id = iq_api.buy(inversion, par, direction, expiracion)
+        # ▼▼▼ NUEVO BLOQUE MEJORADO ▼▼▼
+        check, order_data = iq_api.buy_digital_spot(par, inversion, direction, expiracion)
 
-        if status:
-            msg = f"✅ Orden enviada: {par} | {direction.upper()} | ${inversion} | {expiracion} min"
-            logging.info(msg)
-            return jsonify({"status": "success", "msg": msg, "order_id": order_id}), 200
+        if check:
+          order_id = order_data if isinstance(order_data, (int, str)) else order_data.get('id')
+          msg = f"✅ Orden digital enviada: {par} | {direction.upper()} | ${inversion} | {expiracion} min | ID: {order_id}"
+          logging.info(msg)
+        return jsonify({"status": "success", "msg": msg, "order_id": order_id}), 200
         else:
-            logging.error("❌ La API de IQ Option falló al intentar enviar la orden.")
-            return jsonify({"status": "error", "msg": "Fallo al enviar la orden"}), 500
+        # Esta línea es la clave: nos mostrará la razón real del fallo.
+         error_msg = f"Fallo al enviar la orden. Razón de IQ Option: {order_data}"
+         logging.error(f"❌ {error_msg}")
+        return jsonify({"status": "error", "msg": error_msg}), 500
 
-    # El bloque 'except' termina el 'try'. Captura cualquier otro error inesperado.
-    except Exception as e:
+       # El bloque 'except' termina el 'try'. Captura cualquier otro error inesperado.
+        except Exception as e:
         logging.error(f"🚨 Error inesperado en el webhook: {e}")
         return jsonify({"status": "error", "msg": f"Error interno: {str(e)}"}), 500
 
