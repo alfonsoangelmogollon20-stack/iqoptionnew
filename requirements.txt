@@ -1,2 +1,3 @@
-Flask==3.0.3
-iqoptionapi==0.1
+iqoptionapi
+flask
+requests
