@@ -1,2 +1,4 @@
-flask
-git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+Flask==3.0.3
+gunicorn==20.1.0
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git@master
+requests
