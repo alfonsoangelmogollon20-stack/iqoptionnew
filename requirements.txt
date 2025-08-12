@@ -1,0 +1,3 @@
+Flask==2.3.3
+iqoptionapi==5.0.7
+request==2.31.0
