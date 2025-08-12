@@ -22,7 +22,6 @@ API = None # La conexión se gestionará bajo demanda
 def get_iq_api_connection():
     """
     Gestiona la conexión a IQ Option. Si no existe o se ha perdido, crea una nueva.
-    Esto es crucial para plataformas como Render que pueden 'dormir' el servicio.
     """
     global API
     if API is None or not API.check_connect():
@@ -41,7 +40,6 @@ def get_iq_api_connection():
 # --- Endpoint principal que recibe las alertas ---
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # El bloque 'try' inicia aquí. TODO el código de la operación va dentro.
     try:
         data = request.get_json()
         logging.info(f"📩 Señal recibida: {data}")
@@ -61,7 +59,6 @@ def webhook():
         elif accion == "sell" or accion == "put":
             direction = "put"
 
-        # Si la acción no es válida, 'direction' estará vacía
         if not direction:
             logging.error(f"❌ Acción inválida recibida: '{accion}'")
             return jsonify({"status": "error", "msg": "Acción inválida"}), 400
@@ -71,36 +68,35 @@ def webhook():
         if not iq_api:
             return jsonify({"status": "error", "msg": "No se pudo conectar a IQ Option"}), 500
 
-        inversion = int(data.get("amount", 10))  # Cantidad por operación
-        expiracion = int(data.get("expiration", 5)) # Minutos
+        inversion = int(data.get("amount", 10))
+        expiracion = int(data.get("expiration", 5))
 
-        # ▼▼▼ NUEVO BLOQUE MEJORADO ▼▼▼
+        # --- BLOQUE DE DIAGNÓSTICO MEJORADO ---
         check, order_data = iq_api.buy_digital_spot(par, inversion, direction, expiracion)
 
         if check:
-          order_id = order_data if isinstance(order_data, (int, str)) else order_data.get('id')
-          msg = f"✅ Orden digital enviada: {par} | {direction.upper()} | ${inversion} | {expiracion} min | ID: {order_id}"
-          logging.info(msg)
-        return jsonify({"status": "success", "msg": msg, "order_id": order_id}), 200
+            order_id = order_data if isinstance(order_data, (int, str)) else order_data.get('id')
+            msg = f"✅ Orden digital enviada: {par} | {direction.upper()} | ${inversion} | {expiracion} min | ID: {order_id}"
+            logging.info(msg)
+            return jsonify({"status": "success", "msg": msg, "order_id": order_id}), 200
         else:
-        # Esta línea es la clave: nos mostrará la razón real del fallo.
-         error_msg = f"Fallo al enviar la orden. Razón de IQ Option: {order_data}"
-         logging.error(f"❌ {error_msg}")
-        return jsonify({"status": "error", "msg": error_msg}), 500
-
-       # El bloque 'except' termina el 'try'. Captura cualquier otro error inesperado.
-        except Exception as e:
+            # Esta línea es la clave: nos mostrará la razón real del fallo.
+            error_msg = f"Fallo al enviar la orden. Razón de IQ Option: {order_data}"
+            logging.error(f"❌ {error_msg}")
+            return jsonify({"status": "error", "msg": error_msg}), 500
+            
+    except Exception as e:
         logging.error(f"🚨 Error inesperado en el webhook: {e}")
         return jsonify({"status": "error", "msg": f"Error interno: {str(e)}"}), 500
-
 
 # --- Ruta de prueba para saber si el servidor está vivo ---
 @app.route("/", methods=["GET"])
 def home():
-    return "🚀 Servidor del Bot de IQ Option está activo.", 200
+    return "🚀 Servidor del Bot de IQ Option (con diagnóstico) está activo.", 200
 
 # --- Inicio de la aplicación ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-    
+    app.run(host='0.0.0.0', port=port)
+
+
