@@ -1,76 +1,102 @@
+import os
+import json
+import logging
 from flask import Flask, request, jsonify
 from iqoptionapi.stable_api import IQ_Option
-import json
-import os
 
-# Credenciales IQ Option (cárgalas desde variables de entorno en Render)
-IQ_EMAIL = os.getenv("IQ_EMAIL")
-IQ_PASSWORD = os.getenv("IQ_PASSWORD")
+# --- Configuración de Logging (para ver qué pasa en Render) ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Conexión a IQ Option
-print("Conectando a IQ Option...")
-API = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-API.connect()
-
-if API.check_connect():
-    print("✅ Conectado a IQ Option en cuenta DEMO")
-    API.change_balance("PRACTICE")  # Forzamos demo
-else:
-    print("❌ Error al conectar. Revisa credenciales.")
-    exit()
-
-# Configuración del bot
-INVERSIÓN = 10  # USD por operación
-EXPIRATION = 5  # minutos
-
-# Flask App
+# --- Inicialización de Flask ---
 app = Flask(__name__)
 
+# --- Credenciales y Clave Secreta (Configurar en Render) ---
+IQ_EMAIL = os.environ.get("IQ_EMAIL")
+IQ_PASSWORD = os.environ.get("IQ_PASSWORD")
+SECRET_KEY = os.environ.get("WEBHOOK_SECRET_KEY")
+
+# --- Variables Globales ---
+API = None # La conexión se gestionará bajo demanda
+
+# --- Función para gestionar la conexión a IQ Option ---
+def get_iq_api_connection():
+    """
+    Gestiona la conexión a IQ Option. Si no existe o se ha perdido, crea una nueva.
+    Esto es crucial para plataformas como Render que pueden 'dormir' el servicio.
+    """
+    global API
+    if API is None or not API.check_connect():
+        logging.info("Conexión a IQ Option no encontrada o perdida. Creando una nueva...")
+        API = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+        API.connect()
+        
+        if API.check_connect():
+            logging.info("✅ Conexión con IQ Option establecida correctamente.")
+            API.change_balance("PRACTICE") # Opcional: Forzar cuenta demo
+        else:
+            logging.error("❌ Fallo al conectar con IQ Option. Revisa credenciales.")
+            API = None # Falló, se reinicia para intentar en la próxima señal
+    return API
+
+# --- Endpoint principal que recibe las alertas ---
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # El bloque 'try' inicia aquí. TODO el código de la operación va dentro.
     try:
-        data = json.loads(request.data)
-        print(f"📩 Señal recibida: {data}")
+        data = request.get_json()
+        logging.info(f"📩 Señal recibida: {data}")
 
-        # main.py - Bloque nuevo y mejorado
+        # 1. Verificación de Seguridad
+        if not SECRET_KEY or data.get("secret") != SECRET_KEY:
+            logging.warning("Acceso denegado: Clave secreta incorrecta o no configurada.")
+            return jsonify({"status": "error", "msg": "Clave secreta inválida"}), 403
 
-par = data.get("symbol", "EURUSD")
-accion = data.get("action", "").lower()
-direction = "" # Variable para guardar la dirección final
+        # 2. Lógica de Trading Flexible
+        par = data.get("symbol", "EURUSD")
+        accion = data.get("action", "").lower()
+        
+        direction = "" # Variable para guardar 'call' o 'put'
+        if accion == "buy" or accion == "call":
+            direction = "call"
+        elif accion == "sell" or accion == "put":
+            direction = "put"
 
-if accion == "buy" or accion == "call":
-    direction = "call"
-elif accion == "sell" or accion == "put":
-    direction = "put"
+        # Si la acción no es válida, 'direction' estará vacía
+        if not direction:
+            logging.error(f"❌ Acción inválida recibida: '{accion}'")
+            return jsonify({"status": "error", "msg": "Acción inválida"}), 400
 
-# Si después de comprobar, 'direction' sigue vacía, la acción era inválida
-if not direction:
-    print(f"❌ Acción inválida recibida: '{accion}'")
-    return jsonify({"status": "error", "msg": "Acción inválida"}), 400
+        # 3. Obtener conexión y operar
+        iq_api = get_iq_api_connection()
+        if not iq_api:
+            return jsonify({"status": "error", "msg": "No se pudo conectar a IQ Option"}), 500
 
-# Ahora 'direction' tiene el valor correcto ("call" o "put") para la API
-status, order_id = API.buy(INVERSIÓN, par, direction, EXPIRATION)
+        inversion = int(data.get("amount", 10))  # Cantidad por operación
+        expiracion = int(data.get("expiration", 5)) # Minutos
 
-# ... el resto del código sigue igual ...
-
-
-        status, order_id = API.buy(INVERSIÓN, par, direction, EXPIRATION)
+        status, order_id = iq_api.buy(inversion, par, direction, expiracion)
 
         if status:
-            print(f"✅ Orden enviada: {order_id} | {par} | {direction.upper()} | {INVERSIÓN}$ | {EXPIRATION} min")
-            return jsonify({"status": "success", "order_id": order_id}), 200
+            msg = f"✅ Orden enviada: {par} | {direction.upper()} | ${inversion} | {expiracion} min"
+            logging.info(msg)
+            return jsonify({"status": "success", "msg": msg, "order_id": order_id}), 200
         else:
-            print("❌ Error al enviar la orden")
+            logging.error("❌ La API de IQ Option falló al intentar enviar la orden.")
             return jsonify({"status": "error", "msg": "Fallo al enviar la orden"}), 500
 
+    # El bloque 'except' termina el 'try'. Captura cualquier otro error inesperado.
     except Exception as e:
-        print(f"❌ Error: {e}")
-        return jsonify({"status": "error", "msg": str(e)}), 500
+        logging.error(f"🚨 Error inesperado en el webhook: {e}")
+        return jsonify({"status": "error", "msg": f"Error interno: {str(e)}"}), 500
 
 
+# --- Ruta de prueba para saber si el servidor está vivo ---
 @app.route("/", methods=["GET"])
 def home():
-    return "🚀 Bot IQ Option activo en Render", 200
+    return "🚀 Servidor del Bot de IQ Option está activo.", 200
 
+# --- Inicio de la aplicación ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+    
