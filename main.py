@@ -32,13 +32,27 @@ def webhook():
         data = json.loads(request.data)
         print(f"📩 Señal recibida: {data}")
 
-        par = data.get("symbol", "EURUSD")
-        accion = data.get("action", "").lower()
+        # main.py - Bloque nuevo y mejorado
 
-        if accion not in ["call", "put"]:
-            return jsonify({"status": "error", "msg": "Acción inválida"}), 400
+par = data.get("symbol", "EURUSD")
+accion = data.get("action", "").lower()
+direction = "" # Variable para guardar la dirección final
 
-        direction = "call" if accion == "call" else "put"
+if accion == "buy" or accion == "call":
+    direction = "call"
+elif accion == "sell" or accion == "put":
+    direction = "put"
+
+# Si después de comprobar, 'direction' sigue vacía, la acción era inválida
+if not direction:
+    print(f"❌ Acción inválida recibida: '{accion}'")
+    return jsonify({"status": "error", "msg": "Acción inválida"}), 400
+
+# Ahora 'direction' tiene el valor correcto ("call" o "put") para la API
+status, order_id = API.buy(INVERSIÓN, par, direction, EXPIRATION)
+
+# ... el resto del código sigue igual ...
+
 
         status, order_id = API.buy(INVERSIÓN, par, direction, EXPIRATION)
 
